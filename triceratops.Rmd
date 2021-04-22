@@ -1,0 +1,166 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Triceratops
+
+## Regulatory Regions
+
+Obtain the regulatory regions that have EGFR as target.
+
+```{r}
+library(data.table)
+library(readxl)
+
+genehancer <- read_xlsx("data/GeneHancer_version_4-4.xlsx")
+setDT(genehancer)
+egfr_genehancer <- (genehancer[grepl("=EGFR;", attributes)])
+egfr_genehancer[, id := gsub("genehancer_id=", "", tstrsplit(attributes, ";", fixed = T)[[1]])]
+egfr_genehancer[, association_score := gsub(".*=EGFR;score=(\\d+\\.?\\d+);?.*$", "\\1", egfr_genehancer$attributes)]
+
+bed_egfr_genehancer <- egfr_genehancer[, .(chrom, start, end, id, score * as.numeric(association_score))]
+```
+
+Lift the coordinates to hg19.
+
+```{r}
+library(liftOver)
+library(rtracklayer)
+
+path = system.file(package="liftOver", "extdata", "hg38ToHg19.over.chain")
+ch = import.chain(path)
+
+grange_egfr_genehancer <- as(bed_egfr_genehancer, "GRanges")
+seqlevelsStyle(grange_egfr_genehancer) <- "UCSC"
+
+hg19_grange_egfr_genehancer <- unlist(liftOver(grange_egfr_genehancer, ch))
+egfr_regreg <- data.table(chrom = as.character(seqnames(hg19_grange_egfr_genehancer)),
+                          start = start(hg19_grange_egfr_genehancer),
+                          end = end(hg19_grange_egfr_genehancer),
+                          name = hg19_grange_egfr_genehancer$id,
+                          score = hg19_grange_egfr_genehancer$V5)
+fwrite(egfr_regreg, "results/egfr_regreg.bed",
+       col.names = F, sep = "\t", quote = F)
+```
+
+## Affinities
+
+We use [buffy](https://github.com/fmarotta/buffy).
+
+```{bash}
+buffy <(sed 's/^chr//' results/egfr_regreg.bed) data/chr7.fa data/chr7.gtex_v7.all.vcf data/hocomoco11.pwm results/egfr_affinities.tsv
+```
+
+## Preprocessing
+
+```{r}
+db <- fread("data/egfr_affinities.tsv", col.names = c("REGION", "IID", "TF", "ALLELE", "DB"))
+
+# Exclude constant predictors
+filter <- db[, sd(DB), by = c("REGION", "TF", "ALLELE")][V1 > 0, !"V1"]
+db <- merge(db, filter)
+
+# Keep only enhancers with high genehancer score
+gh_score <- fread("results/egfr_regreg.bed")
+db <- db[REGION %in% gh_score[V5 > 10]$V4]
+
+# Keep only expressed TFs
+tf_annot <- fread("data/HOCOMOCOv11_core_annotation_HUMAN_mono.tsv")
+ensg_map <- as.list(org.Hs.egENSEMBL)
+tf_annot$GENE <- as.character(sapply(tf_annot$EntrezGene, function(eg) ensg_map[[eg]][1]))
+expr <- fread("data/Skin_Sun_Exposed_Lower_leg.rpkm.tsv")
+# TPM = RPKM / sum(RPKM) * 1e6
+m <- as.matrix(expr[, !"GENE"])
+m <- m / colSums(m) * 1e6
+# Find the mean expression of each gene across individuals
+expr_mean <- apply(m, 1, mean)
+# Find the median expression of all genes
+all_genes_median <- median(expr_mean)
+expr <- data.table(GENE = tstrsplit(expr$GENE, ".", fixed = T)[[1]], m)
+expr <- melt(expr, id.vars = "GENE", variable.name = "IID", value.name = "TPM")
+tf_expr <- merge(tf_annot[, c("Model", "GENE")], expr, by = "GENE")
+tf_expr_mean <- tf_expr[, .(mean = mean(TPM)), by = "Model"]
+filter <- tf_expr_mean[mean > all_genes_median, "Model"]
+db <- merge(db, filter, by.x = "TF", by.y = "Model")
+
+# Dcast
+db <- dcast(db, IID ~ REGION + TF + ALLELE, sep = "@", value.var = "DB")
+
+# Add expression
+expr <- fread("data/Skin_Sun_Exposed_Lower_leg.rpkm.tsv")
+# TPM = RPKM / sum(RPKM) * 1e6
+m <- as.matrix(expr[, !"GENE"])
+m <- m / colSums(m) * 1e6
+expr <- data.table(GENE = expr$GENE, m)
+expr <- melt(expr, id.vars = "GENE", variable.name = "IID", value.name = "TPM")
+d <- merge(expr[GENE == "ENSG00000146648.11", !"GENE"], db, by = "IID")
+
+d$GENE <- "EGFR"
+d$TPM <- log(d$TPM)
+
+# Add covariates
+covariates <- fread("data/Skin_Sun_Exposed_Lower_leg.v7.covariates.txt")
+covariates <- dcast(melt(covariates, id.vars = "ID", variable.name = "IID", variable.factor = F), IID ~ ID)
+
+# Obtain the residuals
+iids <- sort(intersect(d$IID, covariates$IID))
+newd <- d[iids, !c("IID", "GENE"), on = "IID"]
+first_lm <- lm(as.matrix(newd) ~ as.matrix(covariates[iids, !c("IID"), on = "IID"]))
+
+d <- as.data.table(lapply(seq_along(newd), function(i) {
+    first_lm$residuals[, i] + mean(newd[[i]])
+}))
+names(d) <- names(newd)
+```
+
+## Nested CV
+
+```{r}
+source("models.R")
+source("utils.R")
+
+params.grid <- list(b = 2^seq(7, -3, length = 50))
+
+set.seed(2020)
+perf <- NestedCV(d,
+                 params.grid = params.grid,
+                 n.outer.folds = 5,
+                 n.inner.folds = 10,
+                 verbose = 3)
+
+xtable(perf$outer.cv$summ, digits = 3)
+```
+
+## Test set
+
+```{r}
+set.seed(1)
+train <- sample(1:nrow(d), nrow(d)*2/3)
+test <- -train
+
+cv <- CV(d[train],
+         params.grid = params.grid,
+         n.folds = 10,
+         fit.best = TRUE,
+         verbose = 2)
+Test(cv$fit, d[test])
+
+y <- d[test]$TPM
+pred_y <- Predict(cv$fit, d[test])
+# plot(y, pred_y)
+# abline(lm(pred_y ~ y))
+# cor(y, pred_y)
+
+library(ggplot2)
+
+ggplot(data.table(y, pred_y), aes(x = y, y = pred_y)) +
+    geom_point() +
+    geom_smooth(method = "lm", formula = 'y ~ x') +
+    coord_fixed(ratio = 2.5) +
+    xlab("True Expression") +
+    ylab("Predicted Expression") +
+    theme_bw()
+```
